@@ -1,0 +1,2 @@
+allocator,iters,warmup,files,bytes,nodes,errors,mean_sec,median_sec,min_sec,max_sec,mbps
+mmap-arena,10,2,133,7193968,1883317,44,1.496988820,1.493157217,1.459527484,1.548831526,4.81
