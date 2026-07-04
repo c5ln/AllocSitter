@@ -7,6 +7,9 @@
 
 static void *free_head = NULL; // free list 머리
 
+// 성능 분석 용
+static AllocStat alloc_stat;
+
 
 // invariant 체크용
 static void *heap_lo = NULL;
@@ -47,14 +50,24 @@ static void set_tags(uint32_t *header, uint32_t tag){
 static void freelist_push(uint32_t *header){
     *(void**)((char*)header + 4) = free_head;
     free_head = (void*)header;
+
+    // 성능 측정용
+    alloc_stat.freelist_len++;
 }
 
 // free list에서 해당 블록을 제거 (없으면 무시)
 static void freelist_remove(uint32_t *header){
     void **link = &free_head;
     while(*link){
+
+        //성능 측정용
+        alloc_stat.remove_steps++;
+
         if(*link == (void*)header){
             *link = *(void**)((char*)header + 4);
+
+            // 성능 측정용. 실제로 제거된 경우에만
+            alloc_stat.freelist_len--;
             return;
         }
         link = (void**)((char*)(*link) + 4);
@@ -65,12 +78,20 @@ void *my_malloc(size_t size){
     // if(size==0) return NULL;
 
     size_t need = (size + 4 + 4 + 15) & ~(size_t)15;  // 16의 배수로 올림 연산. 이진수의 관점으로 보면 된다.
+
     void **link = &free_head;
     while(*link)
     {
+        // 성능 측정용
+        alloc_stat.scan_steps++;
+
         uint32_t* h = (uint32_t*)(*link);
         size_t chunk_size = *h & ~15u;
         if(chunk_size >= need + 16 ) {
+
+            // 성능 측정용
+            alloc_stat.real_bytes += need;
+    
             set_tags(h, need | 1); // 사용 블록 태그
 
             void *payload = (char*)h + 4; // payload 위치
@@ -79,14 +100,25 @@ void *my_malloc(size_t size){
             set_tags(split_header, (uint32_t)(chunk_size - need)); // 남은 free 블록
 
             *link = *(void**)payload; // 원래 블록 unlink
+
+            // 성능 측정용
+            alloc_stat.freelist_len--;
+
             freelist_push(split_header); // 남은 블록 push
             return payload;
         }
         if(chunk_size >= need){
             set_tags(h, (uint32_t)chunk_size | 1); // 통째로 사용 표기
 
+            // 성능 측정용
+            alloc_stat.real_bytes += chunk_size;
+
             void *payload = (char*)h + 4;
             *link = *(void**)payload;
+
+            // 성능 측정용
+            alloc_stat.freelist_len--;
+
             return payload;
         }
         link = (void**)((char*)(*link) + 4);
@@ -103,6 +135,10 @@ void *my_malloc(size_t size){
     if(p==(void*)(-1)){
         return NULL;
     }
+
+    // 성능 계측용
+    alloc_stat.real_bytes += need+pad;
+
     char *header = (char*)p + pad;
     char *payload = header+4;
     set_tags((uint32_t*)header, (uint32_t)need | 1);
@@ -120,7 +156,7 @@ void my_free(void *ptr){
     if(!(*header&1)) return; // double free 방지
     
     *header = *header & (~1u);
-    
+
     // coalescing logic
     // 오른쪽 블록 찾기
     size_t size = *header & ~15u;
@@ -164,6 +200,7 @@ void *my_realloc(void *ptr, size_t size)
         my_free(ptr);
         return NULL;
     }
+
     // 기존의 block size
     size_t old_size = *((uint32_t*)ptr-1) & ~15u;
     // 새로 필요한 size
@@ -265,4 +302,19 @@ void check_invariant()
 
     // 개수 일치 = 두 집합이 같음
     assert(linear_count == freelist_count);              // link 갱신 누락 검출
+
+    // 계측 검증: freelist_len ±1 누락이 있으면 실제 리스트 길이와 어긋난다
+    assert((uint64_t)freelist_count == alloc_stat.freelist_len);
+}
+
+// 통계 스냅샷. 복사본을 반환하므로 driver가 읽는 동안 원본이 변해도 안전하다.
+AllocStat alloc_stat_get(void){
+    return alloc_stat;
+}
+
+// 누적 카운터만 0으로. freelist_len은 현재 상태값이라 보존해야한다.
+void alloc_stat_reset(void){
+    uint64_t len = alloc_stat.freelist_len;
+    memset(&alloc_stat, 0, sizeof alloc_stat);
+    alloc_stat.freelist_len = len;
 }

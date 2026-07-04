@@ -5,6 +5,7 @@
 // cursor traversal, and cleanup.
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,23 +43,41 @@ typedef struct {
     size_t bytes;
 } ParseStats;
 
+// 통계용: tree-sitter가 뭘 요청했나 (논리적 통계).
+// allocator가 그 요청을 어떻게 처리했나는 AllocStat(allocator.h) 담당.
+typedef struct {
+    uint64_t malloc_cnt, calloc_cnt, realloc_cnt, free_cnt;
+    uint64_t req_bytes; // malloc/calloc 요청 bytes 합 (realloc은 횟수만 집계)
+    uint64_t size_hist[64];
+} DataStat;
+
+static DataStat TS_AllocStat;
+
 static const char *allocator_name(AllocatorMode mode) {
     return mode == ALLOC_MMAP_ARENA ? "mmap-arena" : "default";
 }
 
 static void *w_malloc(size_t n) {
+    TS_AllocStat.malloc_cnt++;
+    TS_AllocStat.req_bytes += n;
+    TS_AllocStat.size_hist[size_bucket(n)]++;
     return my_malloc(n);
 }
 
 static void *w_calloc(size_t c, size_t n) {
+    TS_AllocStat.calloc_cnt++;
+    TS_AllocStat.req_bytes += c * n;
+    TS_AllocStat.size_hist[size_bucket(c * n)]++;
     return my_calloc(c, n);
 }
 
 static void *w_realloc(void *p, size_t n) {
+    TS_AllocStat.realloc_cnt++;
     return my_realloc(p, n);
 }
 
 static void w_free(void *p) {
+    TS_AllocStat.free_cnt++;
     my_free(p);
 }
 
@@ -373,6 +392,11 @@ int main(int argc, char **argv) {
         maybe_check_heap(allocator);
     }
 
+    // warmup 동안 쌓인 할당 통계는 버리고 측정 구간만 남긴다.
+    // (freelist_len은 상태값이라 reset에서 보존된다)
+    alloc_stat_reset();
+    memset(&TS_AllocStat, 0, sizeof(TS_AllocStat));
+
     double *times = calloc((size_t)iters, sizeof(*times));
     double *sorted = calloc((size_t)iters, sizeof(*sorted));
     if (!times || !sorted) {
@@ -407,11 +431,20 @@ int main(int argc, char **argv) {
     double mbps = mean > 0.0 ? ((double)last.bytes / 1e6) / mean : 0.0;
     long rss_kb = peak_rss_kb();
 
+    // 측정 구간 종료 시점의 allocator 내부 통계. 이후에는 w_* 호출이 없다.
+    AllocStat astat = alloc_stat_get();
+
     if (csv) {
-        printf("allocator,iters,warmup,files,bytes,nodes,errors,mean_sec,median_sec,min_sec,max_sec,mbps,peak_rss_kb\n");
-        printf("%s,%d,%d,%ld,%zu,%ld,%ld,%.9f,%.9f,%.9f,%.9f,%.2f,%ld\n",
+        printf("allocator,iters,warmup,files,bytes,nodes,errors,mean_sec,median_sec,min_sec,max_sec,mbps,peak_rss_kb,"
+               "malloc_cnt,calloc_cnt,realloc_cnt,free_cnt,req_bytes,real_bytes,scan_steps,remove_steps,freelist_len\n");
+        printf("%s,%d,%d,%ld,%zu,%ld,%ld,%.9f,%.9f,%.9f,%.9f,%.2f,%ld,"
+               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                allocator_name(allocator), iters, warmup, last.files, last.bytes,
-               last.nodes, last.errors, mean, med, min, max, mbps, rss_kb);
+               last.nodes, last.errors, mean, med, min, max, mbps, rss_kb,
+               TS_AllocStat.malloc_cnt, TS_AllocStat.calloc_cnt,
+               TS_AllocStat.realloc_cnt, TS_AllocStat.free_cnt,
+               TS_AllocStat.req_bytes, astat.real_bytes,
+               astat.scan_steps, astat.remove_steps, astat.freelist_len);
     } else {
         printf("allocator    : %s\n", allocator_name(allocator));
         printf("iterations   : %d measured, %d warmup\n", iters, warmup);
@@ -424,6 +457,47 @@ int main(int argc, char **argv) {
         printf("min/max time : %.6f / %.6f s\n", min, max);
         printf("throughput   : %.2f MB/s\n", mbps);
         printf("peak RSS     : %ld KiB\n", rss_kb);
+
+        // 커스텀 allocator일 때만 의미가 있다 (default면 wrapper가 설치되지 않아 전부 0)
+        if (allocator == ALLOC_MMAP_ARENA) {
+            uint64_t alloc_calls = TS_AllocStat.malloc_cnt + TS_AllocStat.calloc_cnt
+                                 + TS_AllocStat.realloc_cnt;
+            // real/req 비율: real에는 realloc 이동으로 생긴 재할당도 포함되므로 근사치다
+            double overhead = TS_AllocStat.req_bytes
+                ? (double)astat.real_bytes / (double)TS_AllocStat.req_bytes : 0.0;
+
+            printf("\n-- alloc stats (measured iterations only) --\n");
+            printf("calls m/c/r/f  : %" PRIu64 " / %" PRIu64 " / %" PRIu64 " / %" PRIu64 "\n",
+                   TS_AllocStat.malloc_cnt, TS_AllocStat.calloc_cnt,
+                   TS_AllocStat.realloc_cnt, TS_AllocStat.free_cnt);
+            printf("requested bytes: %" PRIu64 "\n", TS_AllocStat.req_bytes);
+            printf("real bytes     : %" PRIu64 " (x%.3f of requested)\n",
+                   astat.real_bytes, overhead);
+            printf("scan steps     : %" PRIu64 " (avg %.2f per alloc call)\n",
+                   astat.scan_steps,
+                   alloc_calls ? (double)astat.scan_steps / (double)alloc_calls : 0.0);
+            printf("remove steps   : %" PRIu64 " (avg %.2f per free call)\n",
+                   astat.remove_steps,
+                   TS_AllocStat.free_cnt
+                       ? (double)astat.remove_steps / (double)TS_AllocStat.free_cnt : 0.0);
+            printf("freelist length: %" PRIu64 " (at end)\n", astat.freelist_len);
+
+            printf("request size histogram:\n");
+            uint64_t hist_max = 0;
+            for (int b = 0; b < 64; b++) {
+                if (TS_AllocStat.size_hist[b] > hist_max) hist_max = TS_AllocStat.size_hist[b];
+            }
+            static const char bar[] = "########################################"; // 40칸
+            for (int b = 0; b < 64; b++) {
+                uint64_t cnt = TS_AllocStat.size_hist[b];
+                if (cnt == 0) continue;
+                uint64_t lo = b == 0 ? 0 : (uint64_t)1 << b;
+                uint64_t hi = ((uint64_t)1 << (b + 1)) - 1;
+                int width = (int)((cnt * 40 + hist_max - 1) / hist_max);
+                printf("  %10" PRIu64 " - %-10" PRIu64 " %12" PRIu64 " |%.*s\n",
+                       lo, hi, cnt, width, bar);
+            }
+        }
     }
 
     free(times);
