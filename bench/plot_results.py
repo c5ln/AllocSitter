@@ -22,6 +22,16 @@ PERFORMANCE_METRICS = ["median_sec", "mean_sec", "mbps", "peak_rss_kb"]
 RATIO_METRICS = ["mean_sec", "median_sec", "min_sec", "max_sec", "mbps", "peak_rss_kb"]
 SWEEP_METRICS = ["median_sec", "mbps", "peak_rss_kb"]
 
+# allocator 내부 통계. 커스텀 allocator에서만 수집되므로 (default 행은 전부 0)
+# 파생 지표는 0-나눗셈을 NaN으로 만들어 default 행을 자연스럽게 제외한다.
+ALLOC_RAW_COLS = [
+    "malloc_cnt", "calloc_cnt", "realloc_cnt", "free_cnt",
+    "req_bytes", "real_bytes", "scan_steps", "remove_steps", "freelist_len",
+]
+ALLOC_METRICS = ["scan_per_alloc", "remove_per_free", "real_per_req", "freelist_len"]
+ALLOC_SWEEP_METRICS = ["scan_per_alloc", "remove_per_free", "freelist_len"]
+CALL_KINDS = ["malloc_cnt", "calloc_cnt", "realloc_cnt", "free_cnt"]
+
 LABELS = {
     "mean_sec": "Mean parse time",
     "median_sec": "Median parse time",
@@ -29,6 +39,10 @@ LABELS = {
     "max_sec": "Worst parse time",
     "mbps": "Throughput",
     "peak_rss_kb": "Peak RSS",
+    "scan_per_alloc": "Free-list scan depth (malloc)",
+    "remove_per_free": "Free-list scan depth (remove)",
+    "real_per_req": "Allocated vs requested bytes",
+    "freelist_len": "Free list length (run end)",
 }
 
 UNITS = {
@@ -38,6 +52,10 @@ UNITS = {
     "max_sec": "seconds",
     "mbps": "MB/s",
     "peak_rss_kb": "KiB",
+    "scan_per_alloc": "steps per alloc call",
+    "remove_per_free": "steps per free call",
+    "real_per_req": "ratio",
+    "freelist_len": "blocks",
 }
 
 # 검증된 categorical 팔레트 (blue/orange: CVD ΔE 96.7, 대비 >= 3:1)
@@ -148,7 +166,8 @@ def draw_metric_bars(ax, df, metric):
     agg, yerr = metric_spread(df, metric)
     names = list(agg.index)
     colors = [series_color(n) for n in names]
-    bars = ax.bar(names, agg["mean"], color=colors, width=0.58,
+    width = 0.4 if len(names) == 1 else 0.58
+    bars = ax.bar(names, agg["mean"], color=colors, width=width,
                   yerr=yerr, capsize=5, error_kw={"color": "#334155", "linewidth": 1.2})
     ax.set_title(metric_title(metric))
     ax.set_ylabel(metric_ylabel(metric))
@@ -156,6 +175,11 @@ def draw_metric_bars(ax, df, metric):
     ax.yaxis.set_major_formatter(FuncFormatter(short_number))
     labels = [short_number(v) for v in agg["mean"]]
     ax.bar_label(bars, labels=labels, padding=8, fontsize=9, color="#334155")
+    # 값 라벨이 제목과 겹치지 않게 위쪽 여유 확보
+    ax.margins(y=0.15)
+    ax.set_ylim(bottom=0)
+    if len(names) == 1:
+        ax.set_xlim(-1, 1)
 
 
 def save_metric_bars(df, metric, out_dir):
@@ -272,6 +296,180 @@ def save_sweep_lines(df, metric, out_dir):
     plt.close(fig)
 
 
+# CSV의 원시 카운트를 판단용 파생 지표로 변환한다.
+# 합계는 iteration 수에 비례해 커지므로 호출당 평균이 비교 가능한 단위다.
+def add_alloc_metrics(df):
+    if not all(col in df.columns for col in ALLOC_RAW_COLS):
+        return []
+    for col in ALLOC_RAW_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    alloc_calls = df["malloc_cnt"] + df["calloc_cnt"] + df["realloc_cnt"]
+    df["scan_per_alloc"] = df["scan_steps"].div(alloc_calls).where(alloc_calls > 0)
+    df["remove_per_free"] = df["remove_steps"].div(df["free_cnt"]).where(df["free_cnt"] > 0)
+    df["real_per_req"] = df["real_bytes"].div(df["req_bytes"]).where(df["req_bytes"] > 0)
+    # freelist_len은 default 행에서 0(미수집)이라 NaN 처리해 집계에서 제외
+    df["freelist_len"] = df["freelist_len"].where(alloc_calls > 0)
+    return ALLOC_METRICS
+
+
+def alloc_rows(df):
+    return df[df["scan_per_alloc"].notna()]
+
+
+# 핵심 질문 "어느 탐색이 병목인가"에 답하는 패널: 두 탐색 깊이는 단위가 같으므로
+# (steps/call) 한 축에서 직접 비교한다.
+def draw_scan_depths(ax, sub):
+    metrics = ["scan_per_alloc", "remove_per_free"]
+    kind_labels = ["malloc scan", "remove scan"]
+    agg = sub.groupby("allocator")[metrics].agg(["mean", "min", "max"]).sort_index()
+    series = list(agg.index)
+    bar_w = 0.6 / len(series)
+
+    for i, alloc in enumerate(series):
+        xs = [x + (i - (len(series) - 1) / 2) * bar_w for x in range(len(metrics))]
+        means = [agg.loc[alloc, (m, "mean")] for m in metrics]
+        yerr = [
+            [max(0.0, agg.loc[alloc, (m, "mean")] - agg.loc[alloc, (m, "min")]) for m in metrics],
+            [max(0.0, agg.loc[alloc, (m, "max")] - agg.loc[alloc, (m, "mean")]) for m in metrics],
+        ]
+        bars = ax.bar(xs, means, width=bar_w * 0.92, color=series_color(alloc),
+                      yerr=yerr, capsize=5, label=alloc,
+                      error_kw={"color": "#334155", "linewidth": 1.2})
+        ax.bar_label(bars, labels=[short_number(v) for v in means],
+                     padding=8, fontsize=9, color="#334155")
+
+    ax.set_xticks(range(len(metrics)))
+    ax.set_xticklabels(kind_labels)
+    ax.set_title("Free-list scan depth")
+    ax.set_ylabel("Steps per call")
+    ax.grid(axis="y", alpha=0.25)
+    ax.yaxis.set_major_formatter(FuncFormatter(short_number))
+    ax.margins(y=0.15)
+    ax.set_ylim(bottom=0)
+    if len(series) >= 2:
+        ax.legend(frameon=False)
+
+
+def save_alloc_overview(df, out_dir):
+    sub = alloc_rows(df)
+    if sub.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+    draw_scan_depths(axes[0], sub)
+    draw_metric_bars(axes[1], sub, "real_per_req")
+    axes[1].axhline(1.0, color="#334155", linewidth=1, linestyle="--")
+    draw_metric_bars(axes[2], sub, "freelist_len")
+    fig.suptitle("Custom Allocator Internals (measured iterations)",
+                 fontsize=15, fontweight="bold", y=1.04)
+    fig.tight_layout()
+    fig.savefig(out_dir / "alloc_stats.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+# 호출 종류별 횟수. malloc/free가 지배적이라는 사실 자체가 정보라 linear 축 유지,
+# 작은 막대는 직접 라벨로 읽는다.
+def save_call_mix(df, out_dir):
+    sub = alloc_rows(df)
+    if sub.empty:
+        return
+    agg = sub.groupby("allocator")[CALL_KINDS].mean()
+    names = [k.removesuffix("_cnt") for k in CALL_KINDS]
+    series = list(agg.index)
+    group_w = 0.7
+    bar_w = group_w / len(series)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    for i, alloc in enumerate(series):
+        xs = [x + (i - (len(series) - 1) / 2) * bar_w for x in range(len(CALL_KINDS))]
+        values = agg.loc[alloc, CALL_KINDS]
+        bars = ax.bar(xs, values, width=bar_w * 0.92, color=series_color(alloc), label=alloc)
+        ax.bar_label(bars, labels=[short_number(v) for v in values],
+                     padding=4, fontsize=9, color="#334155")
+    ax.set_xticks(range(len(CALL_KINDS)))
+    ax.set_xticklabels(names)
+    ax.set_title("Allocation calls by kind")
+    ax.set_ylabel("Calls (mean per run)")
+    ax.grid(axis="y", alpha=0.25)
+    ax.yaxis.set_major_formatter(FuncFormatter(short_number))
+    if len(series) >= 2:
+        ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "alloc_call_mix.png", dpi=160)
+    plt.close(fig)
+
+
+# CSV의 size_hist 컬럼("버킷:횟수;버킷:횟수;...")을 dict로 파싱
+def parse_size_hist(value):
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    hist = {}
+    for part in value.split(";"):
+        bucket, _, count = part.partition(":")
+        hist[int(bucket)] = hist.get(int(bucket), 0) + float(count)
+    return hist
+
+
+def fmt_bytes(n):
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.0f}M"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.0f}K"
+    return str(int(n))
+
+
+def bucket_label(b):
+    lo = 0 if b == 0 else 1 << b
+    hi = (1 << (b + 1)) - 1
+    return f"{fmt_bytes(lo)}–{fmt_bytes(hi)}"
+
+
+# 요청 size 분포. 한 버킷이 지배적이라는 사실 자체가 결론이므로 linear 축을 유지하고
+# 꼬리 버킷은 직접 라벨로 읽는다.
+def save_size_hist(df, out_dir):
+    if "size_hist" not in df.columns:
+        return
+
+    sums, runs = {}, {}
+    for _, row in df.iterrows():
+        hist = parse_size_hist(row["size_hist"])
+        if not hist:
+            continue
+        alloc = row["allocator"]
+        acc = sums.setdefault(alloc, {})
+        for bucket, count in hist.items():
+            acc[bucket] = acc.get(bucket, 0) + count
+        runs[alloc] = runs.get(alloc, 0) + 1
+    if not sums:
+        return
+
+    buckets = sorted({b for acc in sums.values() for b in acc})
+    series = sorted(sums)
+    bar_w = 0.7 / len(series)
+
+    fig, ax = plt.subplots(figsize=(max(7.5, 1.1 * len(buckets)), 4.8))
+    for i, alloc in enumerate(series):
+        means = [sums[alloc].get(b, 0) / runs[alloc] for b in buckets]
+        xs = [x + (i - (len(series) - 1) / 2) * bar_w for x in range(len(buckets))]
+        bars = ax.bar(xs, means, width=bar_w * 0.92, color=series_color(alloc), label=alloc)
+        ax.bar_label(bars, labels=[short_number(v) if v else "" for v in means],
+                     padding=4, fontsize=9, color="#334155")
+    ax.set_xticks(range(len(buckets)))
+    ax.set_xticklabels([bucket_label(b) for b in buckets], rotation=30, ha="right")
+    ax.set_title("Request size distribution (log2 buckets)")
+    ax.set_xlabel("Requested size (bytes)")
+    ax.set_ylabel("Requests (mean per run)")
+    ax.grid(axis="y", alpha=0.25)
+    ax.yaxis.set_major_formatter(FuncFormatter(short_number))
+    ax.margins(y=0.15)
+    ax.set_ylim(bottom=0)
+    if len(series) >= 2:
+        ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "size_hist.png", dpi=160)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot allocator benchmark CSV results.")
     parser.add_argument(
@@ -300,13 +498,16 @@ def main():
 
     df = read_inputs(args.inputs)
     metrics = numeric_metrics(df, args.metrics)
+    alloc_metrics = add_alloc_metrics(df)
 
     # bytes가 여러 값이면 스윕 데이터: 크기별로 묶지 않으면 서로 다른
     # workload의 평균이 섞여 무의미해진다.
     is_sweep = "bytes" in df.columns and df["bytes"].nunique() > 1
     keys = ["allocator", "bytes"] if is_sweep else ["allocator"]
 
-    summary = summarize(df, metrics, keys)
+    # 호출 카운트는 summary에도 포함 (파생 지표의 분모 확인용)
+    call_cols = [c for c in CALL_KINDS if c in df.columns] if alloc_metrics else []
+    summary = summarize(df, metrics + alloc_metrics + call_cols, keys)
     summary.to_csv(out_dir / "summary.csv", index=False)
     save_ratio_table(summary, out_dir, keys)
 
@@ -314,11 +515,20 @@ def main():
         for metric in SWEEP_METRICS:
             if metric in metrics:
                 save_sweep_lines(df, metric, out_dir)
+        for metric in ALLOC_SWEEP_METRICS:
+            if metric in alloc_metrics:
+                sub = alloc_rows(df)
+                if not sub.empty:
+                    save_sweep_lines(sub, metric, out_dir)
     else:
         save_overview(df, metrics, out_dir)
         save_speed_comparison(summary, out_dir)
         for metric in metrics:
             save_metric_bars(df, metric, out_dir)
+        if alloc_metrics:
+            save_alloc_overview(df, out_dir)
+            save_call_mix(df, out_dir)
+            save_size_hist(df, out_dir)
 
     print(f"wrote plots to {out_dir}")
     print(summary.to_string(index=False))

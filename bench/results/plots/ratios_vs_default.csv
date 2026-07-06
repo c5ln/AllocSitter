@@ -1,0 +1,2 @@
+allocator,mean_sec_vs_default,median_sec_vs_default,min_sec_vs_default,max_sec_vs_default,mbps_vs_default,peak_rss_kb_vs_default
+mmap-arena,1.6820229965167748,1.693973206954303,1.701322927844791,1.6298800608100306,0.5941962229387379,1.0442306069047016

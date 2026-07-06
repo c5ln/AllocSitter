@@ -435,16 +435,28 @@ int main(int argc, char **argv) {
     AllocStat astat = alloc_stat_get();
 
     if (csv) {
+        // 히스토그램은 비어있지 않은 버킷만 "버킷:횟수;..." 로 한 컬럼에 압축
+        char hist_buf[2048];
+        int hist_off = 0;
+        hist_buf[0] = '\0';
+        for (int b = 0; b < 64; b++) {
+            if (TS_AllocStat.size_hist[b] == 0) continue;
+            int n = snprintf(hist_buf + hist_off, sizeof(hist_buf) - (size_t)hist_off,
+                             "%s%d:%" PRIu64, hist_off ? ";" : "", b, TS_AllocStat.size_hist[b]);
+            if (n < 0 || (size_t)n >= sizeof(hist_buf) - (size_t)hist_off) break;
+            hist_off += n;
+        }
+
         printf("allocator,iters,warmup,files,bytes,nodes,errors,mean_sec,median_sec,min_sec,max_sec,mbps,peak_rss_kb,"
-               "malloc_cnt,calloc_cnt,realloc_cnt,free_cnt,req_bytes,real_bytes,scan_steps,remove_steps,freelist_len\n");
+               "malloc_cnt,calloc_cnt,realloc_cnt,free_cnt,req_bytes,real_bytes,scan_steps,remove_steps,freelist_len,size_hist\n");
         printf("%s,%d,%d,%ld,%zu,%ld,%ld,%.9f,%.9f,%.9f,%.9f,%.2f,%ld,"
-               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
                allocator_name(allocator), iters, warmup, last.files, last.bytes,
                last.nodes, last.errors, mean, med, min, max, mbps, rss_kb,
                TS_AllocStat.malloc_cnt, TS_AllocStat.calloc_cnt,
                TS_AllocStat.realloc_cnt, TS_AllocStat.free_cnt,
                TS_AllocStat.req_bytes, astat.real_bytes,
-               astat.scan_steps, astat.remove_steps, astat.freelist_len);
+               astat.scan_steps, astat.remove_steps, astat.freelist_len, hist_buf);
     } else {
         printf("allocator    : %s\n", allocator_name(allocator));
         printf("iterations   : %d measured, %d warmup\n", iters, warmup);
