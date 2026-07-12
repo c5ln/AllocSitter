@@ -22,7 +22,7 @@ BENCH_INCLUDES = \
 BENCH_CFLAGS = -O3 -DNDEBUG -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE $(BENCH_INCLUDES)
 # 검증 빌드: assert가 살아 있어야 하므로 NDEBUG 금지, 측정용이 아니므로 -O0
 BENCH_CHECK_CFLAGS = -O0 -g -DCHECK -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE $(BENCH_INCLUDES)
-BENCH_SRCS = bench/driver.c src/allocator.c \
+BENCH_SRCS = bench/driver.c src/segregated_allocator.c \
 	$(TREE_SITTER_DIR)/lib/src/lib.c \
 	$(TREE_SITTER_C_DIR)/src/parser.c
 
