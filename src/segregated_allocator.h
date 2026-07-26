@@ -1,5 +1,5 @@
-#ifndef ALLOCATOR_H
-#define ALLOCATOR_H
+#ifndef SEGREGATED_ALLOCATOR_H
+#define SEGREGATED_ALLOCATOR_H
 
 #include <stddef.h>
 #include <unistd.h>

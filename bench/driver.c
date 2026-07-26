@@ -53,6 +53,11 @@ typedef struct {
 
 static DataStat TS_AllocStat;
 
+// --trace=FILE: 측정 구간의 모든 할당 이벤트를 기록. bench/analyze_trace.py가
+// 재생해서 이론적 peak RSS 하한(peak live requested bytes)과 정확한 크기 분포를 계산한다.
+// 포인터는 %p가 NULL을 "(nil)"로 찍는 문제를 피하려고 16진수 정수로 기록.
+static FILE *trace_fp = NULL;
+
 static const char *allocator_name(AllocatorMode mode) {
     return mode == ALLOC_MMAP_ARENA ? "mmap-arena" : "default";
 }
@@ -61,23 +66,30 @@ static void *w_malloc(size_t n) {
     TS_AllocStat.malloc_cnt++;
     TS_AllocStat.req_bytes += n;
     TS_AllocStat.size_hist[size_bucket(n)]++;
-    return my_malloc(n);
+    void *p = my_malloc(n);
+    if (trace_fp) fprintf(trace_fp, "m %zu %lx\n", n, (unsigned long)p);
+    return p;
 }
 
 static void *w_calloc(size_t c, size_t n) {
     TS_AllocStat.calloc_cnt++;
     TS_AllocStat.req_bytes += c * n;
     TS_AllocStat.size_hist[size_bucket(c * n)]++;
-    return my_calloc(c, n);
+    void *p = my_calloc(c, n);
+    if (trace_fp) fprintf(trace_fp, "c %zu %lx\n", c * n, (unsigned long)p);
+    return p;
 }
 
 static void *w_realloc(void *p, size_t n) {
     TS_AllocStat.realloc_cnt++;
-    return my_realloc(p, n);
+    void *q = my_realloc(p, n);
+    if (trace_fp) fprintf(trace_fp, "r %lx %zu %lx\n", (unsigned long)p, n, (unsigned long)q);
+    return q;
 }
 
 static void w_free(void *p) {
     TS_AllocStat.free_cnt++;
+    if (trace_fp && p) fprintf(trace_fp, "f %lx\n", (unsigned long)p);
     my_free(p);
 }
 
@@ -308,7 +320,11 @@ static void usage(const char *argv0) {
             "  --iters=N               measured iterations (default: 5)\n"
             "  --warmup=N              warmup iterations (default: 1)\n"
             "  --include-headers       include .h files as parser inputs\n"
-            "  --csv                   print one CSV row instead of text\n",
+            "  --csv                   print one CSV row instead of text\n"
+            "  --trace=FILE            record measured-iteration alloc events for\n"
+            "                          bench/analyze_trace.py (mmap-arena only;\n"
+            "                          timing in a trace run is unreliable;\n"
+            "                          recommended: --iters=1)\n",
             argv0);
 }
 
@@ -319,6 +335,7 @@ int main(int argc, char **argv) {
     int warmup = 1;
     int include_headers = 0;
     int csv = 0;
+    const char *trace_path = NULL;
     SourceVec sources = {0};
     int explicit_files = 0;
 
@@ -343,6 +360,8 @@ int main(int argc, char **argv) {
             include_headers = 1;
         } else if (strcmp(argv[i], "--csv") == 0) {
             csv = 1;
+        } else if (strncmp(argv[i], "--trace=", 8) == 0) {
+            trace_path = argv[i] + 8;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -379,6 +398,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // 이 시점의 peak RSS ≈ 현재 RSS (아직 파싱 전). 최종 peak에서 이 값을 빼면
+    // 드라이버 자신(소스 버퍼 등)을 제외한 파싱 구간의 RSS 기여가 나온다.
+    long rss_after_load_kb = peak_rss_kb();
+
+    if (trace_path && allocator != ALLOC_MMAP_ARENA) {
+        fprintf(stderr, "--trace requires --allocator=mmap-arena (wrappers are not installed otherwise)\n");
+        free_sources(&sources);
+        return 2;
+    }
+
     if (allocator == ALLOC_MMAP_ARENA) {
         ts_set_allocator(w_malloc, w_calloc, w_realloc, w_free);
     }
@@ -393,9 +422,20 @@ int main(int argc, char **argv) {
     }
 
     // warmup 동안 쌓인 할당 통계는 버리고 측정 구간만 남긴다.
-    // (freelist_len은 상태값이라 reset에서 보존된다)
+    // (freelist_len/live_real_bytes는 상태값이라 reset에서 보존된다)
     alloc_stat_reset();
     memset(&TS_AllocStat, 0, sizeof(TS_AllocStat));
+
+    // trace도 다른 통계와 동일하게 측정 구간만 기록한다 (warmup 이후에 연다)
+    if (trace_path) {
+        trace_fp = fopen(trace_path, "w");
+        if (!trace_fp) {
+            fprintf(stderr, "cannot open trace file %s\n", trace_path);
+            free_sources(&sources);
+            return 1;
+        }
+        fprintf(stderr, "note: tracing to %s — timing/RSS of this run is unreliable\n", trace_path);
+    }
 
     double *times = calloc((size_t)iters, sizeof(*times));
     double *sorted = calloc((size_t)iters, sizeof(*sorted));
@@ -426,6 +466,11 @@ int main(int argc, char **argv) {
         if (i == 0 || times[i] > max) max = times[i];
     }
 
+    if (trace_fp) {
+        fclose(trace_fp);
+        trace_fp = NULL;
+    }
+
     double mean = total / iters;
     double med = median(sorted, iters);
     double mbps = mean > 0.0 ? ((double)last.bytes / 1e6) / mean : 0.0;
@@ -448,15 +493,19 @@ int main(int argc, char **argv) {
         }
 
         printf("allocator,iters,warmup,files,bytes,nodes,errors,mean_sec,median_sec,min_sec,max_sec,mbps,peak_rss_kb,"
-               "malloc_cnt,calloc_cnt,realloc_cnt,free_cnt,req_bytes,real_bytes,scan_steps,remove_steps,freelist_len,size_hist\n");
+               "malloc_cnt,calloc_cnt,realloc_cnt,free_cnt,req_bytes,real_bytes,scan_steps,remove_steps,freelist_len,"
+               "live_real_bytes,peak_live_real_bytes,arena_used_bytes,rss_after_load_kb,impl\n");
         printf("%s,%d,%d,%ld,%zu,%ld,%ld,%.9f,%.9f,%.9f,%.9f,%.2f,%ld,"
-               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
+               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+               "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%ld,%s\n",
                allocator_name(allocator), iters, warmup, last.files, last.bytes,
                last.nodes, last.errors, mean, med, min, max, mbps, rss_kb,
                TS_AllocStat.malloc_cnt, TS_AllocStat.calloc_cnt,
                TS_AllocStat.realloc_cnt, TS_AllocStat.free_cnt,
                TS_AllocStat.req_bytes, astat.real_bytes,
-               astat.scan_steps, astat.remove_steps, astat.freelist_len, hist_buf);
+               astat.scan_steps, astat.remove_steps, astat.freelist_len,
+               astat.live_real_bytes, astat.peak_live_real_bytes,
+               astat.arena_used_bytes, rss_after_load_kb, ALLOC_IMPL);
     } else {
         printf("allocator    : %s\n", allocator_name(allocator));
         printf("iterations   : %d measured, %d warmup\n", iters, warmup);
@@ -468,7 +517,8 @@ int main(int argc, char **argv) {
         printf("median time  : %.6f s\n", med);
         printf("min/max time : %.6f / %.6f s\n", min, max);
         printf("throughput   : %.2f MB/s\n", mbps);
-        printf("peak RSS     : %ld KiB\n", rss_kb);
+        printf("peak RSS     : %ld KiB (after source load: %ld KiB → parse-phase ≈ %ld KiB)\n",
+               rss_kb, rss_after_load_kb, rss_kb - rss_after_load_kb);
 
         // 커스텀 allocator일 때만 의미가 있다 (default면 wrapper가 설치되지 않아 전부 0)
         if (allocator == ALLOC_MMAP_ARENA) {
@@ -493,6 +543,20 @@ int main(int argc, char **argv) {
                    TS_AllocStat.free_cnt
                        ? (double)astat.remove_steps / (double)TS_AllocStat.free_cnt : 0.0);
             printf("freelist length: %" PRIu64 " (at end)\n", astat.freelist_len);
+
+            // 메모리 레이어 분해. 이론 하한(peak live requested)은 --trace +
+            // analyze_trace.py로 구한다. 여기서는 그 위의 두 층을 보여준다:
+            //   peak live real  = 살아있는 블록 최고점 (header/footer/올림 포함)
+            //   arena used      = arena에서 커밋한 총량 (free list에 잡힌 양 포함)
+            printf("\n-- memory layers (measured iterations only) --\n");
+            printf("peak live real : %" PRIu64 " bytes\n", astat.peak_live_real_bytes);
+            printf("end live real  : %" PRIu64 " bytes\n", astat.live_real_bytes);
+            printf("arena used     : %" PRIu64 " bytes (x%.3f of peak live real)\n",
+                   astat.arena_used_bytes,
+                   astat.peak_live_real_bytes
+                       ? (double)astat.arena_used_bytes / (double)astat.peak_live_real_bytes : 0.0);
+            printf("freelist held  : %" PRIu64 " bytes (arena used - end live)\n",
+                   astat.arena_used_bytes - astat.live_real_bytes);
 
             printf("request size histogram:\n");
             uint64_t hist_max = 0;
