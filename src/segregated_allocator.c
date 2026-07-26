@@ -41,6 +41,13 @@ static void *arena_extend(size_t n){
 }
 
 
+// live_real_bytes 증가 + peak 갱신. 감소는 my_free가 직접 한다.
+static void live_add(uint64_t n){
+    alloc_stat.live_real_bytes += n;
+    if(alloc_stat.live_real_bytes > alloc_stat.peak_live_real_bytes)
+        alloc_stat.peak_live_real_bytes = alloc_stat.live_real_bytes;
+}
+
 // 블록 헤더/footer에 동일한 tag(size|flag) 기록. footer 위치는 tag의 size로 계산
 static void set_tags(uint32_t *header, uint32_t tag){
     *header = tag;
@@ -90,7 +97,8 @@ void *my_malloc(size_t size){
 
             // 성능 측정용
             alloc_stat.real_bytes += need;
-    
+            live_add(need);
+
             set_tags(h, need | 1); // 사용 블록 태그
 
             void *payload = (char*)h + 4; // payload 위치
@@ -111,6 +119,7 @@ void *my_malloc(size_t size){
 
             // 성능 측정용
             alloc_stat.real_bytes += chunk_size;
+            live_add(chunk_size);
 
             void *payload = (char*)h + 4;
             *link = *(void**)payload;
@@ -135,8 +144,9 @@ void *my_malloc(size_t size){
         return NULL;
     }
 
-    // 성능 계측용
+    // 성능 측정용
     alloc_stat.real_bytes += need+pad;
+    live_add(need); // pad는 블록 밖 정렬 낭비라 live가 아니라 arena_used에만 잡힌다
 
     char *header = (char*)p + pad;
     char *payload = header+4;
@@ -155,6 +165,9 @@ void my_free(void *ptr){
     if(!(*header&1)) return; // double free 방지
     
     *header = *header & (~1u);
+
+    // 성능 측정용
+    alloc_stat.live_real_bytes -= *header & ~15u;
 
     uint32_t bin = size_to_bin(*header);
     freelist_push(header,bin);
@@ -192,6 +205,7 @@ void check_invariant()
     #define MAX_NODES 500000
     static void *linear_free_list[MAX_NODES];
     int linear_count = 0;
+    uint64_t used_bytes = 0;
 
     // 블록 단위 검사 + chunk 수집
     for(char* p = heap_lo; p < (char*)heap_hi;){
@@ -202,14 +216,19 @@ void check_invariant()
         assert(chunk >= 16); // 메모리 최소 크기 확인
         assert(p+chunk <= (char*)heap_hi); // chunk가 heap 안 넘는지
         assert((*(uint32_t*)(p + chunk - 4) & ~15u) == chunk); // header 크기 == footer 크기
-     
+
         if ((*(uint32_t*)p & 1) == 0) {
             assert(linear_count < MAX_NODES); // 수집 배열 overflow 방지
             linear_free_list[linear_count++] = p ;
+        } else {
+            used_bytes += chunk;
         }
 
-        p += chunk;  
+        p += chunk;
     }
+
+    // 측정 검증: 사용중 블록의 실제 합 == live_real_bytes 회계
+    assert(used_bytes == alloc_stat.live_real_bytes);
       
 
       
@@ -245,12 +264,18 @@ void check_invariant()
 
 // 통계 스냅샷. 복사본을 반환하므로 driver가 읽는 동안 원본이 변해도 안전하다.
 AllocStat alloc_stat_get(void){
-    return alloc_stat;
+    AllocStat s = alloc_stat;
+    s.arena_used_bytes = arena_base ? (uint64_t)(arena_cur - arena_base) : 0;
+    return s;
 }
 
-// 누적 카운터만 0으로. freelist_len은 현재 상태값이라 보존해야한다.
+// 누적 카운터만 0으로. freelist_len/live_real_bytes는 현재 상태값이라 보존해야한다.
+// peak은 측정 구간 기준으로 다시 세도록 현재 live에서 재시작.
 void alloc_stat_reset(void){
     uint64_t len = alloc_stat.freelist_len;
+    uint64_t live = alloc_stat.live_real_bytes;
     memset(&alloc_stat, 0, sizeof alloc_stat);
     alloc_stat.freelist_len = len;
+    alloc_stat.live_real_bytes = live;
+    alloc_stat.peak_live_real_bytes = live;
 }

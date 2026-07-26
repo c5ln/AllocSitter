@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "allocator.h"
+#include "segregated_allocator.h"
 
 // 검증 모드: gcc -DCHECK 로 켜면 매 연산마다 invariant 검사
 #ifdef CHECK
